@@ -471,7 +471,13 @@ impl State {
                 tracing::Span::current().record("event_type", "Event::Timer");
                 self.timer_armed = false;
                 self.arm_timer();
-                self.state.cache_mask = 0;
+                // The render cache only redraws the tabs widget on tab events,
+                // so a spinning tab has to count as one.
+                self.state.cache_mask = if self.spinner_on_screen() {
+                    UpdateEventMask::Tab as u8
+                } else {
+                    0
+                };
 
                 should_render = true;
             }
