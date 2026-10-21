@@ -562,7 +562,6 @@ mod test {
         assert!(mc.needs_session_updates());
     }
 
-    use super::*;
     use anstyle::{Effects, RgbColor};
 
     #[test]
