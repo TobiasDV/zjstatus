@@ -29,6 +29,74 @@ pub struct TabsWidget {
     tab_truncate_start_format: Vec<FormattedPart>,
     tab_truncate_end_format: Vec<FormattedPart>,
     tab_zero_based_index: bool,
+    spinner: Option<TabSpinner>,
+}
+
+/// Animates a marker that something else puts in front of a tab name, e.g. a
+/// status hook renaming a tab to "» build" while work runs. The bar swaps the
+/// marker for a spinner frame at render time, so the tab is renamed once
+/// instead of on every frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TabSpinner {
+    marker: String,
+    frames: Vec<String>,
+    interval_ms: u64,
+}
+
+impl TabSpinner {
+    /// `tab_spinner_marker` and `tab_spinner_frames` (space separated) are
+    /// required, `tab_spinner_fps` defaults to 4 and is capped at 20.
+    pub fn from_config(config: &BTreeMap<String, String>) -> Option<Self> {
+        let marker = config.get("tab_spinner_marker")?.trim().to_owned();
+        let frames: Vec<String> = config
+            .get("tab_spinner_frames")?
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+
+        if marker.is_empty() || frames.is_empty() {
+            return None;
+        }
+
+        let fps = config
+            .get("tab_spinner_fps")
+            .and_then(|fps| fps.parse::<u64>().ok())
+            .filter(|fps| *fps > 0)
+            .unwrap_or(4)
+            .min(20);
+
+        Some(Self {
+            marker,
+            frames,
+            interval_ms: 1000 / fps,
+        })
+    }
+
+    /// Seconds between two frames.
+    pub fn interval(&self) -> f64 {
+        self.interval_ms as f64 / 1000.0
+    }
+
+    pub fn is_spinning(&self, name: &str) -> bool {
+        name.strip_prefix(self.marker.as_str())
+            .is_some_and(|rest| rest.starts_with(' '))
+    }
+
+    /// The name with its marker replaced by frame `tick`, or unchanged.
+    pub fn frame(&self, name: &str, tick: u64) -> String {
+        match name.strip_prefix(self.marker.as_str()) {
+            Some(rest) if rest.starts_with(' ') => {
+                let frame = &self.frames[(tick % self.frames.len() as u64) as usize];
+                format!("{frame}{rest}")
+            }
+            _ => name.to_owned(),
+        }
+    }
+
+    /// Frame number from the wall clock, so every spinner on screen agrees.
+    fn tick_now(&self) -> u64 {
+        chrono::Utc::now().timestamp_millis().max(0) as u64 / self.interval_ms
+    }
 }
 
 impl TabsWidget {
@@ -126,6 +194,7 @@ impl TabsWidget {
             tab_truncate_start_format,
             tab_truncate_end_format,
             tab_zero_based_index,
+            spinner: TabSpinner::from_config(config),
         }
     }
 }
@@ -300,19 +369,22 @@ impl TabsWidget {
         let formatters = self.select_format(tab, mode);
         let mut output = "".to_owned();
 
+        let tab_name = match mode.mode {
+            InputMode::RenameTab => match tab.name.is_empty() {
+                true => "Enter name...".to_owned(),
+                false => tab.name.clone(),
+            },
+            _name => match &self.spinner {
+                Some(spinner) => spinner.frame(&tab.name, spinner.tick_now()),
+                None => tab.name.clone(),
+            },
+        };
+
         for f in formatters.iter() {
             let mut content = f.content.clone();
 
-            let tab_name = match mode.mode {
-                InputMode::RenameTab => match tab.name.is_empty() {
-                    true => "Enter name...",
-                    false => tab.name.as_str(),
-                },
-                _name => tab.name.as_str(),
-            };
-
             if content.contains("{name}") {
-                content = content.replace("{name}", tab_name);
+                content = content.replace("{name}", &tab_name);
             }
 
             if content.contains("{index}") {
@@ -460,10 +532,80 @@ pub fn get_tab_window(
 
 #[cfg(test)]
 mod test {
+    use std::collections::BTreeMap;
+
     use zellij_tile::prelude::TabInfo;
 
-    use super::get_tab_window;
+    use super::{TabSpinner, TabsWidget, get_tab_window};
+    use crate::{config::ZellijState, widgets::widget::Widget};
     use rstest::rstest;
+
+    fn spinner_config(fps: Option<&str>) -> BTreeMap<String, String> {
+        let mut config = BTreeMap::from([
+            ("tab_spinner_marker".to_owned(), "»".to_owned()),
+            ("tab_spinner_frames".to_owned(), "⠋ ⠙ ⠹".to_owned()),
+        ]);
+        if let Some(fps) = fps {
+            config.insert("tab_spinner_fps".to_owned(), fps.to_owned());
+        }
+        config
+    }
+
+    #[test]
+    fn spinner_needs_marker_and_frames() {
+        assert!(TabSpinner::from_config(&spinner_config(None)).is_some());
+
+        let mut no_marker = spinner_config(None);
+        no_marker.remove("tab_spinner_marker");
+        assert!(TabSpinner::from_config(&no_marker).is_none());
+
+        let mut no_frames = spinner_config(None);
+        no_frames.insert("tab_spinner_frames".to_owned(), "  ".to_owned());
+        assert!(TabSpinner::from_config(&no_frames).is_none());
+    }
+
+    #[rstest]
+    #[case(None, 250)]
+    #[case(Some("2"), 500)]
+    #[case(Some("0"), 250)]
+    #[case(Some("fast"), 250)]
+    #[case(Some("100"), 50)]
+    fn spinner_interval(#[case] fps: Option<&str>, #[case] expected_ms: u64) {
+        let spinner = TabSpinner::from_config(&spinner_config(fps)).unwrap();
+        assert_eq!((spinner.interval() * 1000.0).round() as u64, expected_ms);
+    }
+
+    #[rstest]
+    #[case("» build", 0, "⠋ build")]
+    #[case("» build", 1, "⠙ build")]
+    #[case("» build", 4, "⠙ build")]
+    #[case("»build", 0, "»build")]
+    #[case("✓ build", 0, "✓ build")]
+    #[case("build", 0, "build")]
+    fn spinner_frame(#[case] name: &str, #[case] tick: u64, #[case] expected: &str) {
+        let spinner = TabSpinner::from_config(&spinner_config(None)).unwrap();
+        assert_eq!(spinner.frame(name, tick), expected);
+        assert_eq!(spinner.is_spinning(name), name.starts_with("» "));
+    }
+
+    #[test]
+    fn spinner_replaces_marker_in_rendered_tab() {
+        let mut config = spinner_config(None);
+        config.insert("tab_normal".to_owned(), "{name}".to_owned());
+        let state = ZellijState {
+            tabs: vec![TabInfo {
+                name: "» build".to_owned(),
+                active: true,
+                ..TabInfo::default()
+            }],
+            ..ZellijState::default()
+        };
+
+        let output = TabsWidget::new(&config).process("tabs", &state);
+
+        assert!(output.contains(" build"));
+        assert!(!output.contains('»'));
+    }
 
     #[rstest]
     #[case(

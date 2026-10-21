@@ -15,7 +15,7 @@ use zjstatus::{
         pipe::PipeWidget,
         session::SessionWidget,
         swap_layout::SwapLayoutWidget,
-        tabs::TabsWidget,
+        tabs::{TabSpinner, TabsWidget},
         widget::Widget,
     },
 };
@@ -33,6 +33,9 @@ struct State {
     widget_map: BTreeMap<String, Arc<dyn Widget>>,
     focus_cwd_commands: Vec<String>,
     needs_timer: bool,
+    spinner: Option<TabSpinner>,
+    visible: bool,
+    timer_armed: bool,
     err: Option<anyhow::Error>,
 }
 
@@ -90,6 +93,11 @@ impl ZellijPlugin for State {
         if self.module_config.needs_session_updates() {
             events.push(EventType::SessionUpdate);
         }
+        // The tab spinner only animates while its bar is on screen.
+        self.spinner = TabSpinner::from_config(&configuration);
+        if self.spinner.is_some() {
+            events.push(EventType::Visible);
+        }
         subscribe(&events);
 
         // Same reasoning for the refresh timer: an armed instance re-renders
@@ -98,9 +106,7 @@ impl ZellijPlugin for State {
         self.needs_timer = configuration
             .values()
             .any(|value| render::content_needs_timer(value));
-        if self.needs_timer {
-            set_timeout(REFRESH_INTERVAL_SECONDS);
-        }
+        self.arm_timer();
         self.widget_map = register_widgets(&configuration);
         self.focus_cwd_commands =
             zjstatus::widgets::command::focus_cwd_command_names(&configuration);
@@ -198,6 +204,68 @@ impl ZellijPlugin for State {
 }
 
 impl State {
+    /// Whether this instance sits in the tab its client is looking at, or
+    /// None until a PaneUpdate has listed this plugin's pane.
+    fn in_active_tab(&self) -> Option<bool> {
+        let me = get_plugin_ids().plugin_id;
+        let position = self
+            .state
+            .panes
+            .panes
+            .iter()
+            .find_map(|(position, panes)| {
+                panes
+                    .iter()
+                    .any(|p| p.is_plugin && p.id == me)
+                    .then_some(*position)
+            })?;
+
+        Some(
+            self.state
+                .tabs
+                .iter()
+                .any(|tab| tab.active && tab.position == position),
+        )
+    }
+
+    fn update_visibility(&mut self) {
+        if self.spinner.is_none() {
+            return;
+        }
+        if let Some(visible) = self.in_active_tab() {
+            self.visible = visible;
+        }
+        self.arm_timer();
+    }
+
+    fn spinner_on_screen(&self) -> bool {
+        self.visible
+            && self.spinner.as_ref().is_some_and(|spinner| {
+                self.state
+                    .tabs
+                    .iter()
+                    .any(|tab| spinner.is_spinning(&tab.name))
+            })
+    }
+
+    /// Arms the next timer unless one is pending: the spinner's interval while
+    /// a tab spins on screen, else the refresh interval if a widget needs it.
+    /// One pending timer at a time, so timers never multiply.
+    fn arm_timer(&mut self) {
+        if self.timer_armed {
+            return;
+        }
+
+        let interval = match &self.spinner {
+            Some(spinner) if self.spinner_on_screen() => spinner.interval(),
+            _ if self.needs_timer => REFRESH_INTERVAL_SECONDS,
+            _ => return,
+        };
+
+        set_timeout(interval);
+        self.timer_armed = true;
+    }
+
     fn update_focused_pane(&mut self) {
         let active_tab = self.state.tabs.iter().find(|t| t.active);
 
@@ -294,6 +362,7 @@ impl State {
                 self.state.cache_mask = UpdateEventMask::Tab as u8;
 
                 self.update_focused_pane();
+                self.update_visibility();
 
                 should_render = true;
             }
@@ -387,13 +456,21 @@ impl State {
                 self.state.cache_mask = UpdateEventMask::Tab as u8;
                 self.state.tabs = tab_info;
 
+                self.update_visibility();
+
                 should_render = true;
+            }
+            Event::Visible(visible) => {
+                tracing::Span::current().record("event_type", "Event::Visible");
+                self.visible = visible;
+                self.arm_timer();
+
+                should_render = visible;
             }
             Event::Timer(_) => {
                 tracing::Span::current().record("event_type", "Event::Timer");
-                if self.needs_timer {
-                    set_timeout(REFRESH_INTERVAL_SECONDS);
-                }
+                self.timer_armed = false;
+                self.arm_timer();
                 self.state.cache_mask = 0;
 
                 should_render = true;
