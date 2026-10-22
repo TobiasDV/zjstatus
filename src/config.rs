@@ -26,6 +26,9 @@ pub struct ZellijState {
     pub cache_mask: u8,
     pub focused_pane_id: Option<PaneId>,
     pub focused_pane_cwd: Option<std::path::PathBuf>,
+    /// Columns the tabs may fill with tab_fit_width: beside the rest of the
+    /// bar, and once the overlength rule hides the parts ranked below them.
+    pub tab_space: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Debug, Ord, Eq, PartialEq, PartialOrd, Copy)]
@@ -88,6 +91,11 @@ pub struct ModuleConfig {
     pub border: BorderConfig,
     pub format_precedence: Vec<Part>,
     pub hide_on_overlength: bool,
+    /// The part holding {tabs} when tab_fit_width is on, and that part
+    /// without {tabs}, rendered to measure what the tabs must leave room for.
+    pub tabs_part: Option<Part>,
+    pub tabs_rest_parts: Vec<FormattedPart>,
+    pub last_tab_space: Option<(usize, usize)>,
 }
 
 impl ModuleConfig {
@@ -168,6 +176,24 @@ impl ModuleConfig {
 
         let border_config = parse_border_config(config).unwrap_or_default();
 
+        let tabs_part = config
+            .get("tab_fit_width")
+            .is_some_and(|v| v == "true")
+            .then(|| {
+                [
+                    (Part::Left, left_parts_config),
+                    (Part::Center, center_parts_config),
+                    (Part::Right, right_parts_config),
+                ]
+                .into_iter()
+                .find(|(_, conf)| conf.contains("{tabs}"))
+            })
+            .flatten();
+        let tabs_rest_parts = match tabs_part {
+            Some((_, conf)) => parts_from_config(Some(&conf.replace("{tabs}", "")), config),
+            None => vec![],
+        };
+
         Ok(Self {
             left_parts_config: left_parts_config.to_owned(),
             left_parts: parts_from_config(Some(&left_parts_config.to_owned()), config),
@@ -184,12 +210,15 @@ impl ModuleConfig {
             border: border_config,
             format_precedence,
             hide_on_overlength,
+            tabs_part: tabs_part.map(|(part, _)| part),
+            tabs_rest_parts,
+            last_tab_space: None,
         })
     }
 
     pub fn handle_mouse_action(
         &mut self,
-        state: ZellijState,
+        mut state: ZellijState,
         mouse: Mouse,
         widget_map: BTreeMap<String, Arc<dyn Widget>>,
     ) {
@@ -205,35 +234,7 @@ impl ModuleConfig {
             Mouse::Hover(_, _) => return,
         };
 
-        let output_left = self.left_parts.iter_mut().fold("".to_owned(), |acc, part| {
-            format!(
-                "{}{}",
-                acc,
-                part.format_string_with_widgets(&widget_map, &state)
-            )
-        });
-
-        let output_center = self
-            .center_parts
-            .iter_mut()
-            .fold("".to_owned(), |acc, part| {
-                format!(
-                    "{}{}",
-                    acc,
-                    part.format_string_with_widgets(&widget_map, &state)
-                )
-            });
-
-        let output_right = self
-            .right_parts
-            .iter_mut()
-            .fold("".to_owned(), |acc, part| {
-                format!(
-                    "{}{}",
-                    acc,
-                    part.format_string_with_widgets(&widget_map, &state)
-                )
-            });
+        let (output_left, output_center, output_right) = self.render_parts(&mut state, &widget_map);
 
         let (output_left, output_center, output_right) = match self.hide_on_overlength {
             true => self.trim_output(&output_left, &output_center, &output_right, state.cols),
@@ -346,7 +347,7 @@ impl ModuleConfig {
 
     pub fn render_bar(
         &mut self,
-        state: ZellijState,
+        mut state: ZellijState,
         widget_map: BTreeMap<String, Arc<dyn Widget>>,
     ) -> String {
         if self.left_parts.is_empty() && self.center_parts.is_empty() && self.right_parts.is_empty()
@@ -354,32 +355,7 @@ impl ModuleConfig {
             return "No configuration found. See https://github.com/dj95/zjstatus/wiki/3-%E2%80%90-Configuration for more info".to_string();
         }
 
-        let output_left = self.left_parts.iter_mut().fold("".to_owned(), |acc, part| {
-            format!(
-                "{acc}{}",
-                part.format_string_with_widgets(&widget_map, &state)
-            )
-        });
-
-        let output_center = self
-            .center_parts
-            .iter_mut()
-            .fold("".to_owned(), |acc, part| {
-                format!(
-                    "{acc}{}",
-                    part.format_string_with_widgets(&widget_map, &state)
-                )
-            });
-
-        let output_right = self
-            .right_parts
-            .iter_mut()
-            .fold("".to_owned(), |acc, part| {
-                format!(
-                    "{acc}{}",
-                    part.format_string_with_widgets(&widget_map, &state)
-                )
-            });
+        let (output_left, output_center, output_right) = self.render_parts(&mut state, &widget_map);
 
         let (output_left, output_center, output_right) = match self.hide_on_overlength {
             true => self.trim_output(&output_left, &output_center, &output_right, state.cols),
@@ -437,6 +413,71 @@ impl ModuleConfig {
             self.get_spacer(&output_left, &output_right, state.cols),
             output_right,
         )
+    }
+
+    /// Renders the left, center and right parts. With tab_fit_width the
+    /// other parts go first, so the tabs get the room they leave.
+    fn render_parts(
+        &mut self,
+        state: &mut ZellijState,
+        widget_map: &BTreeMap<String, Arc<dyn Widget>>,
+    ) -> (String, String, String) {
+        let mut output = BTreeMap::new();
+
+        for part in [Part::Left, Part::Center, Part::Right] {
+            if Some(part) != self.tabs_part {
+                output.insert(part, render_all(self.parts_mut(part), widget_map, state));
+            }
+        }
+
+        if let Some(tabs_part) = self.tabs_part {
+            let rest = console::measure_text_width(&render_all(
+                &mut self.tabs_rest_parts,
+                widget_map,
+                state,
+            ));
+            let rank = |part: Part| self.format_precedence.iter().position(|p| *p == part);
+            let others = |keep: &dyn Fn(Part) -> bool| -> usize {
+                output
+                    .iter()
+                    .filter(|(part, _)| keep(**part))
+                    .map(|(_, text)| console::measure_text_width(text))
+                    .sum()
+            };
+
+            let narrow = state.cols.saturating_sub(rest + others(&|_| true));
+            let wide = match self.hide_on_overlength {
+                true => state
+                    .cols
+                    .saturating_sub(rest + others(&|part| rank(part) < rank(tabs_part))),
+                false => narrow,
+            };
+
+            state.tab_space = Some((narrow, wide));
+            if state.tab_space != self.last_tab_space {
+                state.cache_mask |= UpdateEventMask::Tab as u8;
+                self.last_tab_space = state.tab_space;
+            }
+
+            output.insert(
+                tabs_part,
+                render_all(self.parts_mut(tabs_part), widget_map, state),
+            );
+        }
+
+        (
+            output.remove(&Part::Left).unwrap_or_default(),
+            output.remove(&Part::Center).unwrap_or_default(),
+            output.remove(&Part::Right).unwrap_or_default(),
+        )
+    }
+
+    fn parts_mut(&mut self, part: Part) -> &mut Vec<FormattedPart> {
+        match part {
+            Part::Left => &mut self.left_parts,
+            Part::Center => &mut self.center_parts,
+            Part::Right => &mut self.right_parts,
+        }
     }
 
     fn trim_output(
@@ -529,6 +570,16 @@ impl ModuleConfig {
     }
 }
 
+fn render_all(
+    parts: &mut [FormattedPart],
+    widget_map: &BTreeMap<String, Arc<dyn Widget>>,
+    state: &ZellijState,
+) -> String {
+    parts.iter_mut().fold(String::new(), |acc, part| {
+        acc + &part.format_string_with_widgets(widget_map, state)
+    })
+}
+
 fn parts_from_config(
     format: Option<&String>,
     config: &BTreeMap<String, String>,
@@ -580,5 +631,193 @@ mod test {
                 ..Default::default()
             },
         )
+    }
+
+    // Click handlers call into zellij, which wasmtime cannot provide: a
+    // widget behind `dyn Widget` would link them into the test binary.
+    struct NoClick<W>(W);
+
+    impl<W: Widget> Widget for NoClick<W> {
+        fn process(&self, name: &str, state: &ZellijState) -> String {
+            self.0.process(name, state)
+        }
+
+        fn process_click(&self, _name: &str, _state: &ZellijState, _pos: usize) {}
+    }
+
+    // The bar from dotfiles' zellij main.kdl, with the clock as fixed text
+    // (the command widgets need a zellij host).
+    fn fitted_bar() -> (ModuleConfig, BTreeMap<String, Arc<dyn Widget>>) {
+        let config: BTreeMap<String, String> = [
+            ("format_left", "#[fg=#928374,bg=#282828] {session} {tabs}"),
+            (
+                "format_right",
+                "#[fg=#1d2021,bg=#d3869b,bold] W43 #[fg=#d4be98,bg=#45403d] Thu/22/10 #[fg=#1d2021,bg=#89b482,bold] 16:42:08 ",
+            ),
+            ("format_space", "#[bg=#282828]"),
+            ("format_hide_on_overlength", "true"),
+            (
+                "tab_normal",
+                "#[fg=#a89984,bg=#504945] {index} #[fg=#ddc7a1,bg=#504945]{name} ",
+            ),
+            (
+                "tab_active",
+                "#[fg=#7c6f64,bg=#d8a657] {index} #[fg=#1d2021,bg=#d8a657,bold]{name} ",
+            ),
+            ("tab_separator", " "),
+            ("tab_fit_width", "true"),
+            ("tab_truncate_start_format", "#[fg=#a89984,bg=#282828]‹{count} "),
+            ("tab_truncate_end_format", "#[fg=#a89984,bg=#282828] {count}›"),
+            ("tab_spinner_marker", "»"),
+            ("tab_spinner_frames", "· ✢ ✳ ✶ ✻ ✽"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+
+        let mut widgets: BTreeMap<String, Arc<dyn Widget>> = BTreeMap::new();
+        widgets.insert(
+            "session".to_owned(),
+            Arc::new(NoClick(crate::widgets::session::SessionWidget::new(
+                &config,
+            ))),
+        );
+        widgets.insert(
+            "tabs".to_owned(),
+            Arc::new(NoClick(crate::widgets::tabs::TabsWidget::new(&config))),
+        );
+
+        (ModuleConfig::new(&config).unwrap(), widgets)
+    }
+
+    fn render_fitted(
+        module: &mut ModuleConfig,
+        widgets: &BTreeMap<String, Arc<dyn Widget>>,
+        names: &[String],
+        active: usize,
+        cols: usize,
+    ) -> String {
+        let state = ZellijState {
+            cols,
+            mode: ModeInfo {
+                session_name: Some("coding-mutations-2".to_owned()),
+                ..ModeInfo::default()
+            },
+            tabs: names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| TabInfo {
+                    position: i,
+                    active: i == active,
+                    name: name.clone(),
+                    ..TabInfo::default()
+                })
+                .collect(),
+            ..ZellijState::default()
+        };
+
+        console::strip_ansi_codes(&module.render_bar(state, widgets.clone())).to_string()
+    }
+
+    fn tab_sets() -> Vec<Vec<String>> {
+        let real = [
+            "✓ sloprik",
+            "» coordination",
+            "✓ 39067-system-made-values-attribution",
+            "✓ 38947-38948-template-line-user-changes",
+        ];
+        let many = (0..17).map(|i| format!("story-{}{}", i, "-word".repeat(i % 6)));
+
+        vec![
+            real.iter().map(|s| s.to_string()).collect(),
+            many.collect(),
+            vec!["only-tab".to_owned()],
+        ]
+    }
+
+    const SESSION_WIDTH: usize = " coding-mutations-2 ".len();
+    const CLOCK_WIDTH: usize = " W43  Thu/22/10  16:42:08 ".len();
+
+    fn marker_width(hidden: usize) -> usize {
+        match hidden {
+            0 => 0,
+            n => 2 + n.to_string().len(),
+        }
+    }
+
+    #[test]
+    fn fitted_tabs_hold_up_at_every_width() {
+        let marker = Regex::new(r"‹(\d+) |\s(\d+)›").unwrap();
+
+        for names in tab_sets() {
+            let count = names.len();
+
+            for active in 0..count {
+                let (mut module, widgets) = fitted_bar();
+
+                for cols in 10..=400 {
+                    let bar = render_fitted(&mut module, &widgets, &names, active, cols);
+                    let width = console::measure_text_width(&bar);
+                    let at = format!("{count} tabs, active {active}, {cols} cols: {bar:?}");
+
+                    // the active tab, with at least the start of its name
+                    let index = format!(" {} ", active + 1);
+                    let head: String = names[active].chars().skip(1).take(4).collect();
+                    assert!(bar.contains(&format!("{index}")), "no active tab: {at}");
+                    assert!(bar.contains(&head), "active name cut away: {at}");
+
+                    // hidden counts and shown tabs add up, around the active one
+                    let mut hidden = (0, 0);
+                    for cap in marker.captures_iter(&bar) {
+                        if let Some(n) = cap.get(1) {
+                            hidden.0 = n.as_str().parse().unwrap();
+                        }
+                        if let Some(n) = cap.get(2) {
+                            hidden.1 = n.as_str().parse().unwrap();
+                        }
+                    }
+                    let shown: Vec<usize> = (1..=count)
+                        .filter(|i| bar.contains(&format!(" {i} ")))
+                        .collect();
+                    let expected: Vec<usize> = (hidden.0 + 1..=count - hidden.1).collect();
+                    assert_eq!(shown, expected, "{at}");
+
+                    let active_alone = SESSION_WIDTH
+                        + 3
+                        + (active + 1).to_string().len()
+                        + console::measure_text_width(&names[active])
+                        + marker_width(active)
+                        + marker_width(count - 1 - active);
+
+                    // fills the bar exactly once the squeezed active tab fits
+                    if cols >= active_alone - names[active].chars().count() + 8 {
+                        assert_eq!(width, cols, "bar not filled: {at}");
+                    }
+
+                    // the clock goes only when it could not have stayed
+                    let clock = bar.contains("16:42:08");
+                    if !clock {
+                        assert!(
+                            active_alone + CLOCK_WIDTH > cols || CLOCK_WIDTH > cols / 2,
+                            "clock dropped with room for it: {at}"
+                        );
+                    }
+                    if cols == 400 && count < 17 {
+                        assert!(clock, "{at}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fitted_tabs_samples() {
+        let names = &tab_sets()[0];
+        let (mut module, widgets) = fitted_bar();
+
+        for cols in [40, 47, 60, 80, 100, 120, 160, 200, 358] {
+            let bar = render_fitted(&mut module, &widgets, names, 2, cols);
+            println!("{cols:>4} |{bar}|");
+        }
     }
 }

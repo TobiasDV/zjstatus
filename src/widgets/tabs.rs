@@ -29,7 +29,6 @@ pub struct TabsWidget {
     tab_truncate_start_format: Vec<FormattedPart>,
     tab_truncate_end_format: Vec<FormattedPart>,
     tab_fit_width: bool,
-    tab_fit_reserve: usize,
     tab_zero_based_index: bool,
     spinner: Option<TabSpinner>,
 }
@@ -161,15 +160,10 @@ impl TabsWidget {
             .map(|form| FormattedPart::multiple_from_format_string(form, config))
             .unwrap_or_default();
 
-        // `tab_fit_width "true"`: show as many tabs around the active one as
-        // fit in the bar, `tab_fit_reserve` columns kept free for the rest of
-        // the bar (session name, clock). Overrides tab_display_count.
+        // `tab_fit_width "true"`: as many tabs around the active one as fit in
+        // the room the rest of the bar leaves (ZellijState::tab_space).
+        // Overrides tab_display_count.
         let tab_fit_width = config.get("tab_fit_width").is_some_and(|v| v == "true");
-
-        let tab_fit_reserve = config
-            .get("tab_fit_reserve")
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
 
         let tab_zero_based_index = match config.get("tab_zero_based_index") {
             Some(e) => matches!(e.as_str(), "true"),
@@ -206,7 +200,6 @@ impl TabsWidget {
             tab_truncate_start_format,
             tab_truncate_end_format,
             tab_fit_width,
-            tab_fit_reserve,
             tab_zero_based_index,
             spinner: TabSpinner::from_config(config),
         }
@@ -215,170 +208,169 @@ impl TabsWidget {
 
 impl Widget for TabsWidget {
     fn process(&self, _name: &str, state: &ZellijState) -> String {
-        let mut output = "".to_owned();
-        let mut counter = 0;
+        let window = self.window(state);
 
-        let (truncated_start, truncated_end, tabs) = self.tab_window(state);
+        let mut output = self.truncate_marker(&self.tab_truncate_start_format, window.hidden_start);
 
-        if truncated_start > 0 {
-            for f in &self.tab_truncate_start_format {
-                let mut content = f.content.clone();
+        for (i, (_, rendered)) in window.tabs.iter().enumerate() {
+            output.push_str(rendered);
 
-                if content.contains("{count}") {
-                    content = content.replace("{count}", (truncated_start).to_string().as_str());
-                }
-
-                output = format!("{output}{}", f.format_string(&content));
-            }
-        }
-
-        for tab in &tabs {
-            let content = self.render_tab(tab, &state.panes, &state.mode);
-            counter += 1;
-
-            output = format!("{}{}", output, content);
-
-            if counter < tabs.len()
+            if i + 1 < window.tabs.len()
                 && let Some(sep) = &self.separator
             {
-                output = format!("{}{}", output, sep.format_string(&sep.content));
+                output.push_str(&sep.format_string(&sep.content));
             }
         }
 
-        if truncated_end > 0 {
-            for f in &self.tab_truncate_end_format {
-                let mut content = f.content.clone();
-
-                if content.contains("{count}") {
-                    content = content.replace("{count}", (truncated_end).to_string().as_str());
-                }
-
-                output = format!("{output}{}", f.format_string(&content));
-            }
-        }
+        output.push_str(&self.truncate_marker(&self.tab_truncate_end_format, window.hidden_end));
 
         output
     }
 
     fn process_click(&self, _name: &str, state: &ZellijState, pos: usize) {
-        let mut offset = 0;
-        let mut counter = 0;
+        let window = self.window(state);
 
-        let (truncated_start, truncated_end, tabs) = self.tab_window(state);
+        let Some(active_pos) = state.tabs.iter().find(|t| t.active).map(|t| t.position + 1) else {
+            return;
+        };
 
-        let active_pos = &state
-            .tabs
-            .iter()
-            .find(|t| t.active)
-            .expect("no active tab")
-            .position
-            + 1;
+        let mut offset = console::measure_text_width(
+            &self.truncate_marker(&self.tab_truncate_start_format, window.hidden_start),
+        );
 
-        if truncated_start > 0 {
-            for f in &self.tab_truncate_start_format {
-                let mut content = f.content.clone();
-
-                if content.contains("{count}") {
-                    content = content.replace("{count}", (truncated_end).to_string().as_str());
-                }
-
-                offset += console::measure_text_width(&f.format_string(&content));
-
-                if pos <= offset {
-                    switch_tab_to(active_pos.saturating_sub(1) as u32);
-                }
-            }
+        if window.hidden_start > 0 && pos <= offset {
+            switch_tab_to(active_pos.saturating_sub(1) as u32);
+            return;
         }
 
-        for tab in &tabs {
-            counter += 1;
+        for (i, (tab, rendered)) in window.tabs.iter().enumerate() {
+            let mut width = console::measure_text_width(rendered);
 
-            let mut rendered_content = self.render_tab(tab, &state.panes, &state.mode);
-
-            if counter < tabs.len()
+            if i + 1 < window.tabs.len()
                 && let Some(sep) = &self.separator
             {
-                rendered_content =
-                    format!("{}{}", rendered_content, sep.format_string(&sep.content));
+                width += console::measure_text_width(&sep.format_string(&sep.content));
             }
 
-            let content_len = console::measure_text_width(&rendered_content);
-
-            if pos > offset && pos < offset + content_len {
+            if pos > offset && pos < offset + width {
                 switch_tab_to(tab.position as u32 + 1);
-
-                break;
+                return;
             }
 
-            offset += content_len;
+            offset += width;
         }
 
-        if truncated_end > 0 {
-            for f in &self.tab_truncate_end_format {
-                let mut content = f.content.clone();
-
-                if content.contains("{count}") {
-                    content = content.replace("{count}", (truncated_end).to_string().as_str());
-                }
-
-                offset += console::measure_text_width(&f.format_string(&content));
-
-                if pos <= offset {
-                    switch_tab_to(cmp::min(active_pos + 1, state.tabs.len()) as u32);
-                }
-            }
+        if window.hidden_end > 0 {
+            switch_tab_to(cmp::min(active_pos + 1, state.tabs.len()) as u32);
         }
     }
 }
 
+/// The tabs to draw, each with its rendered text, and how many are hidden on
+/// either side.
+struct TabWindow {
+    hidden_start: usize,
+    hidden_end: usize,
+    tabs: Vec<(TabInfo, String)>,
+}
+
+/// Shortest name a squeezed active tab keeps, ellipsis included.
+const MIN_NAME_WIDTH: usize = 8;
+
 impl TabsWidget {
-    /// The tabs to draw: every tab, a fixed count, or as many as fit.
-    fn tab_window(&self, state: &ZellijState) -> (usize, usize, Vec<TabInfo>) {
+    /// Every tab, a fixed count, or as many as fit (tab_fit_width).
+    fn window(&self, state: &ZellijState) -> TabWindow {
+        let render = |t: &TabInfo| self.render_tab(t, &state.panes, &state.mode);
+
         if !self.tab_fit_width {
-            return get_tab_window(&state.tabs, self.tab_display_count);
+            let (hidden_start, hidden_end, tabs) =
+                get_tab_window(&state.tabs, self.tab_display_count);
+
+            return TabWindow {
+                hidden_start,
+                hidden_end,
+                tabs: tabs.into_iter().map(|t| (t.clone(), render(&t))).collect(),
+            };
         }
 
-        let widths: Vec<usize> = state
-            .tabs
+        let rendered: Vec<String> = state.tabs.iter().map(render).collect();
+        let widths: Vec<usize> = rendered
             .iter()
-            .map(|t| console::measure_text_width(&self.render_tab(t, &state.panes, &state.mode)))
+            .map(|r| console::measure_text_width(r))
             .collect();
         let separator = self
             .separator
             .as_ref()
             .map(|s| console::measure_text_width(&s.format_string(&s.content)))
             .unwrap_or(0);
-        let budget = state.cols.saturating_sub(self.tab_fit_reserve);
+        let count = state.tabs.len();
+        let width = |first: usize, last: usize| {
+            widths[first..last].iter().sum::<usize>()
+                + separator * (last - first).saturating_sub(1)
+                + self.truncate_width(&self.tab_truncate_start_format, first)
+                + self.truncate_width(&self.tab_truncate_end_format, count - last)
+        };
 
-        let (first, last) = fit_tab_window(
-            &state.tabs,
-            &widths,
-            separator,
-            budget,
-            |n| self.truncate_width(&self.tab_truncate_start_format, n),
-            |n| self.truncate_width(&self.tab_truncate_end_format, n),
-        );
+        let Some(active) = state.tabs.iter().position(|t| t.active) else {
+            return TabWindow {
+                hidden_start: 0,
+                hidden_end: 0,
+                tabs: state.tabs.iter().cloned().zip(rendered).collect(),
+            };
+        };
 
-        (
-            first,
-            state.tabs.len() - last,
-            state.tabs[first..last].to_vec(),
-        )
+        // Beside the rest of the bar when the active tab fits there, else in
+        // the room left once the overlength rule hides the lesser parts.
+        let (narrow, wide) = state.tab_space.unwrap_or((state.cols, state.cols));
+        let budget = if width(active, active + 1) <= narrow {
+            narrow
+        } else {
+            wide
+        };
+
+        let (first, last) = fit_tab_window(count, active, budget, width);
+        let mut tabs: Vec<(TabInfo, String)> = (first..last)
+            .map(|i| (state.tabs[i].clone(), rendered[i].clone()))
+            .collect();
+
+        // Only the active tab is left and it still overflows: shorten its
+        // name, unless it is being renamed.
+        let overflow = width(first, last).saturating_sub(budget);
+        if overflow > 0
+            && state.mode.mode != InputMode::RenameTab
+            && let Some((tab, text)) = tabs.iter_mut().find(|(t, _)| t.active)
+        {
+            let name_width = console::measure_text_width(&tab.name);
+            let keep = name_width.saturating_sub(overflow).max(MIN_NAME_WIDTH);
+
+            if keep < name_width {
+                let mut short = tab.clone();
+                short.name = console::truncate_str(&tab.name, keep, "…").into_owned();
+                *text = render(&short);
+            }
+        }
+
+        TabWindow {
+            hidden_start: first,
+            hidden_end: count - last,
+            tabs,
+        }
     }
 
-    /// Width of a truncation marker announcing `count` hidden tabs.
-    fn truncate_width(&self, formats: &[FormattedPart], count: usize) -> usize {
+    /// The marker announcing `count` hidden tabs, empty when none are.
+    fn truncate_marker(&self, formats: &[FormattedPart], count: usize) -> String {
         if count == 0 {
-            return 0;
+            return String::new();
         }
 
         formats
             .iter()
-            .map(|f| {
-                let content = f.content.replace("{count}", &count.to_string());
-                console::measure_text_width(&f.format_string(&content))
-            })
-            .sum()
+            .map(|f| f.format_string(&f.content.replace("{count}", &count.to_string())))
+            .collect()
+    }
+
+    fn truncate_width(&self, formats: &[FormattedPart], count: usize) -> usize {
+        console::measure_text_width(&self.truncate_marker(formats, count))
     }
 
     fn select_format(&self, info: &TabInfo, mode: &ModeInfo) -> &Vec<FormattedPart> {
@@ -595,39 +587,26 @@ pub fn get_tab_window(
     )
 }
 
-/// The widest run of tabs around the active one whose rendered width stays
-/// within `budget`, separators and truncation markers included. Grows one
-/// tab after, then one before, until neither fits. Returns a half-open index
-/// range that always contains the active tab, whatever its width.
+/// The widest run of tabs around `active` whose `width(first, last)` stays
+/// within `budget`. Grows one tab after, then one before, until neither
+/// fits. Returns a half-open range that always holds the active tab.
 pub fn fit_tab_window(
-    tabs: &[TabInfo],
-    widths: &[usize],
-    separator: usize,
+    count: usize,
+    active: usize,
     budget: usize,
-    start_marker: impl Fn(usize) -> usize,
-    end_marker: impl Fn(usize) -> usize,
+    width: impl Fn(usize, usize) -> usize,
 ) -> (usize, usize) {
-    let Some(active) = tabs.iter().position(|t| t.active) else {
-        return (0, tabs.len());
-    };
-
-    let total = |first: usize, last: usize| {
-        widths[first..last].iter().sum::<usize>()
-            + separator * (last - first - 1)
-            + start_marker(first)
-            + end_marker(tabs.len() - last)
-    };
-
     let (mut first, mut last) = (active, active + 1);
+
     loop {
         let mut grew = false;
 
-        if last < tabs.len() && total(first, last + 1) <= budget {
+        if last < count && width(first, last + 1) <= budget {
             last += 1;
             grew = true;
         }
 
-        if first > 0 && total(first - 1, last) <= budget {
+        if first > 0 && width(first - 1, last) <= budget {
             first -= 1;
             grew = true;
         }
@@ -1119,39 +1098,73 @@ mod test {
     #[case(0, 30, (0, 2))] // first tab active: only the end marker counts
     #[case(4, 30, (3, 5))] // last tab active: only the start marker counts
     fn fit_window(#[case] active: usize, #[case] budget: usize, #[case] expected: (usize, usize)) {
-        let tabs = tabs(active, 5);
         let marker = |n: usize| if n == 0 { 0 } else { 4 };
-        assert_eq!(
-            fit_tab_window(&tabs, &[10; 5], 1, budget, marker, marker),
-            expected
-        );
+        let width = |first: usize, last: usize| {
+            10 * (last - first) + (last - first - 1) + marker(first) + marker(5 - last)
+        };
+        assert_eq!(fit_tab_window(5, active, budget, width), expected);
     }
 
-    #[test]
-    fn fit_width_shrinks_with_the_bar() {
-        let config = BTreeMap::from([
+    fn fit_widget() -> TabsWidget {
+        TabsWidget::new(&BTreeMap::from([
             ("tab_normal".to_owned(), " {name} ".to_owned()),
             ("tab_active".to_owned(), "*{name}*".to_owned()),
             ("tab_fit_width".to_owned(), "true".to_owned()),
-            ("tab_fit_reserve".to_owned(), "2".to_owned()),
             (
                 "tab_truncate_start_format".to_owned(),
                 "<{count}".to_owned(),
             ),
             ("tab_truncate_end_format".to_owned(), "{count}>".to_owned()),
-        ]);
-        let widget = TabsWidget::new(&config);
-        let state = |cols| ZellijState {
-            tabs: tabs(2, 5),
-            cols,
+        ]))
+    }
+
+    fn fit_bar(widget: &TabsWidget, tabs: Vec<TabInfo>, space: (usize, usize)) -> String {
+        let state = ZellijState {
+            tabs,
+            tab_space: Some(space),
             ..ZellijState::default()
         };
+        console::strip_ansi_codes(&widget.process("tabs", &state)).to_string()
+    }
 
-        let bar =
-            |cols| console::strip_ansi_codes(&widget.process("tabs", &state(cols))).to_string();
+    #[test]
+    fn fit_width_shrinks_with_the_bar() {
+        let widget = fit_widget();
 
-        assert_eq!(bar(80), " 0  1 *2* 3  4 ");
-        assert_eq!(bar(15), "<1 1 *2* 3 1>");
-        assert_eq!(bar(5), "<2*2*2>");
+        assert_eq!(fit_bar(&widget, tabs(2, 5), (80, 80)), " 0  1 *2* 3  4 ");
+        assert_eq!(fit_bar(&widget, tabs(2, 5), (13, 13)), "<1 1 *2* 3 1>");
+        assert_eq!(fit_bar(&widget, tabs(2, 5), (3, 3)), "<2*2*2>");
+    }
+
+    #[test]
+    fn fit_width_takes_the_wide_room_when_the_active_tab_needs_it() {
+        let widget = fit_widget();
+
+        // the active tab with markers is 7 wide: 6 is too narrow
+        assert_eq!(fit_bar(&widget, tabs(2, 5), (6, 13)), "<1 1 *2* 3 1>");
+        // it fits beside the rest of the bar: stay narrow
+        assert_eq!(fit_bar(&widget, tabs(2, 5), (7, 13)), "<2*2*2>");
+    }
+
+    #[test]
+    fn fit_width_shortens_an_active_tab_that_still_overflows() {
+        let widget = fit_widget();
+        let long = |active: bool, name: &str| TabInfo {
+            active,
+            name: name.to_owned(),
+            ..TabInfo::default()
+        };
+        let tabs = || {
+            vec![
+                long(false, "a"),
+                long(true, "39067-system-made-values-attribution"),
+                long(false, "b"),
+            ]
+        };
+
+        // 2 + 2 + 2 for markers and stars leaves 14 for the name
+        assert_eq!(fit_bar(&widget, tabs(), (20, 20)), "<1*39067-system-…*1>");
+        // never shorter than MIN_NAME_WIDTH
+        assert_eq!(fit_bar(&widget, tabs(), (5, 5)), "<1*39067-s…*1>");
     }
 }
