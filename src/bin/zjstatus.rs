@@ -191,6 +191,10 @@ impl ZellijPlugin for State {
             return;
         }
 
+        // A narrower bar fits fewer tabs: redraw the tabs widget.
+        if self.state.cols != cols {
+            self.state.cache_mask |= UpdateEventMask::Tab as u8;
+        }
         self.state.cols = cols;
 
         tracing::debug!("{:?}", self.state.mode.session_name);
