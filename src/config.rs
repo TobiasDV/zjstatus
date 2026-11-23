@@ -232,6 +232,8 @@ impl ModuleConfig {
             Mouse::Hold(_, y) => y,
             Mouse::Release(_, y) => y,
             Mouse::Hover(_, _) => return,
+            // The LeftClick before it already acted on the position.
+            Mouse::DoubleClick(_, _) => return,
         };
 
         let (output_left, output_center, output_right) = self.render_parts(&mut state, &widget_map);

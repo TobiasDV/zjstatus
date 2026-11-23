@@ -18,6 +18,7 @@ pub struct ModeWidget {
     search_format: Vec<FormattedPart>,
     rename_tab_format: Vec<FormattedPart>,
     rename_pane_format: Vec<FormattedPart>,
+    rename_session_format: Vec<FormattedPart>,
     session_format: Vec<FormattedPart>,
     move_format: Vec<FormattedPart>,
     prompt_format: Vec<FormattedPart>,
@@ -77,6 +78,11 @@ impl ModeWidget {
             None => vec![],
         };
 
+        let rename_session_format = match config.get("mode_rename_session") {
+            Some(form) => FormattedPart::multiple_from_format_string(form, config),
+            None => vec![],
+        };
+
         let session_format = match config.get("mode_session") {
             Some(form) => FormattedPart::multiple_from_format_string(form, config),
             None => vec![],
@@ -110,6 +116,7 @@ impl ModeWidget {
             search_format,
             rename_tab_format,
             rename_pane_format,
+            rename_session_format,
             session_format,
             move_format,
             prompt_format,
@@ -155,6 +162,7 @@ impl ModeWidget {
             InputMode::Search => &self.search_format,
             InputMode::RenameTab => &self.rename_tab_format,
             InputMode::RenamePane => &self.rename_pane_format,
+            InputMode::RenameSession => &self.rename_session_format,
             InputMode::Session => &self.session_format,
             InputMode::Move => &self.move_format,
             InputMode::Prompt => &self.prompt_format,
@@ -199,6 +207,7 @@ fn map_string_to_mode(s: &str) -> Option<InputMode> {
         "search" => Some(InputMode::Search),
         "rename_tab" => Some(InputMode::RenameTab),
         "rename_pane" => Some(InputMode::RenamePane),
+        "rename_session" => Some(InputMode::RenameSession),
         "session" => Some(InputMode::Session),
         "move" => Some(InputMode::Move),
         "prompt" => Some(InputMode::Prompt),
